@@ -1,18 +1,59 @@
+import torch
+import torch.nn as nn
+
 class RoughSetFeatureSelector(nn.Module):
-    def __init__(self, num_features):
+    def __init__(self, num_features, sigma=1.0, alpha=10.0):
         super(RoughSetFeatureSelector, self).__init__()
-        # 1. This is your "Trainable Weights theta" from your code
-        # We initialize with ones so sigmoid starts around 0.73
+        # Step 4.1.2 - Step 1: Learnable weights w
         self.theta = nn.Parameter(torch.ones(num_features)) 
+        self.sigma = sigma
+        self.alpha = alpha # This is for the "Smooth Max" approximation
 
     def get_weights(self):
-        # 2. Converting raw weights into sigmoid so they stay between 0 and 1
         return torch.sigmoid(self.theta)
 
-    def forward(self, x):
-        # This multiplies the features by the weights (your Step 1)
+    def forward(self, x, labels=None):
         weights = self.get_weights()
-        return x * weights, weights
+        x_weighted = x * weights
+        
+        # If we are just running the model, return the weighted features
+        if labels is None:
+            return x_weighted, weights
+
+        # Step 4.1.2 - Step 2: Differentiable Indiscernibility Relation (R)
+        # Calculate Weighted Euclidean Distance
+        dist = torch.cdist(x_weighted, x_weighted, p=2)
+        R = torch.exp(-(dist**2) / (2 * self.sigma**2))
+
+        # Step 4.1.2 - Step 3: Soft Lower Approximation (mu)
+        # This part calculates how 'certain' we are about each sample
+        num_samples = x.shape
+        mu_list = []
+        
+        for i in range(num_samples):
+            # Find indices of samples NOT in the same class (Step 3: j not in Cc)
+            different_class_mask = (labels != labels[i])
+            
+            if different_class_mask.any():
+                # Smooth Maximum approximation (SoftMin logic)
+                enemy_sims = R[i, different_class_mask]
+                # Applying the SoftMax formula from your screenshot:
+                # max(Rij) approx sum(Rij * exp(alpha*Rij)) / sum(exp(alpha*Rij))
+                numerator = torch.sum(enemy_sims * torch.exp(self.alpha * enemy_sims))
+                denominator = torch.sum(torch.exp(self.alpha * enemy_sims))
+                max_sim = numerator / (denominator + 1e-8)
+                
+                mu_list.append(1.0 - max_sim)
+            else:
+                mu_list.append(torch.tensor(1.0, device=x.device))
+
+        # Step 4.1.2 - Step 4: Dependency Degree (gamma)
+        gamma = torch.stack(mu_list).mean()
+        
+        # L_rs = 1 - gamma
+        rough_set_loss = 1.0 - gamma
+        
+        return x_weighted, weights, rough_set_loss
     
 class FuzzyRNN(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_rules=3):
